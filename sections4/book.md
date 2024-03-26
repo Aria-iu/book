@@ -366,4 +366,109 @@ pub type LockResult\<Guard> = Result\<Guard, PoisonError\<Guard>>;
 
 Mutex: Send+Sync。这已经很完善了，为什么我们还需要将其包括进入Arc？Arc\<T>是原子引用计数指针。Rc\<T>是非线程安全的，因为在其中的强/弱引用计数器上有竞争。Arc\<T>是建立在Atomic\<Integer>上的，这会在之后的章节介绍。不管怎么说，Arc\<T>能够作为引用计数指针而在多线程状态下不会引发数据竞争（因为计数器是原子操作）。
 
+为什么使用Arc\<Mutex\<Ring>>？Mutex\<Ring>可以移动但是不能被克隆。看一下Mutex：
+```Rust
+    pub struct Mutex<T: ?Sized> {
+        inner: sys::Mutex,
+        poison: poison::Flag,
+        data: UnsafeCell<T>,
+    }
+```
+我们看到T可以实现Sized或者!Sized，T被存储在UnsafeCell\<T>，其与sys::Mutex一起存储。每个Rust运行的平台会提供它自己对Mutex的实现，通常与操作系统的环境紧绑在一起。在Rust源码中,你可以找到sys::Mutex包裹了依赖系统实现的Mutex。Unix对Mutex的实现在src/libstd/sys/unix/mutex.rs中，如下：
+```Rust
+    pub struct Mutex{
+        inner: UnsafeCell<libc::pthread_mutex_t>,
+    }
+```
+但是Mutex并非必须在系统基础上实现，后续章节我们会看到当实现我们的lcok时，会使用atomic primitives。
+
+当我们clone Mutex时，会发生什么？我们会需要新的system mutex的分配地址，如果T本身是可以克隆的话，还需要新的UnsafeCell。这个新的system mutex是问题所在，线程必须在内存中同样的数据结构上进行同步。将Mutex丢到Arc中可以解决这个问题。克隆Arc，就像克隆Rc一样，创建一个新的对Mutex的强引用。这些新的引用是不可变引用。
+在Rust提供的抽象模型中，Mutex本身没有内部状态。Rust的Mutex使用内部UnsafeCell提供的内部可变性。Mutex本身是不可变的，而内部T通过MutexGuard可变地引用。这在Rust的内存模型中是安全的，因为由于互斥，在任何给定时间都只有一个对T的可变引用。
+
+经过多次运行，程序本身也能顺利运行完成。不幸的是，从理论上讲，它并不是特别有效。对Mutex上锁是有开销的，当我们线程的操作简短时，一个线程持有锁，其他的都在愚蠢地等待。
+
+使用perf可以证明这一点：
+```
+> perf stat --event task-clock,context-switches,page-faults,cycles,instructions,branches,branch-misses,cache-references,cache-misses ./data_race02
+
+ Performance counter stats for './data_race02':
+
+          4,694.34 msec task-clock                       #    1.696 CPUs utilized
+           190,739      context-switches                 #   40.632 K/sec
+               111      page-faults                      #   23.646 /sec
+    16,716,392,784      cycles                           #    3.561 GHz                         (83.54%)
+    12,370,949,135      instructions                     #    0.74  insn per cycle              (83.47%)
+     2,646,307,332      branches                         #  563.723 M/sec                       (83.60%)
+       302,586,307      branch-misses                    #   11.43% of all branches             (83.00%)
+       172,326,200      cache-references                 #   36.709 M/sec                       (83.24%)
+        15,770,640      cache-misses                     #    9.15% of all cache refs           (83.16%)
+
+       2.767760772 seconds time elapsed
+
+       1.285505000 seconds user
+       3.246514000 seconds sys
+```
+## 使用MPSC
+Ring究竟做了什么？首先，它有一个固定的容量和一对reader/writer。其次，Ring是一个数据结构，旨在通过两个或多个线程来操作，这些线程有两个动作：reading和writing。Ring是一种在线程之间传递u32,按照写入的顺序读取数据的一种手段。
+
+庆幸的是，只要我们能够接受只有一个reader线程存在的情况，Rust可以使用标准库的一些手段来满足这个需求，就是std::sync::mpsc。The Multi Producer Single Consumer queue中，writer端叫做Sender\<T>，可以被克隆并且转移到多线程中;reader端，叫做Revceier\<T>，只能被转移，不能被克隆。这里有两种Sender变体可以使用，Sender\<T>和SyncSender\<T>。前者代表无限的MPSC，意味着这个通道需要多少内存就会开辟多少内存来存储到来的T数据。后者表示有限的MPSC，说明通道有一个固定的上限。
+
+Rust文档描述Sender\<T>和SyncSender\<T>分别是异步和同步的，严格上来说，不是这样的。SyncSender\<T>::send当管道没有空间可用时，会阻塞，但是，还有一个方法SyncSender<T>::try_send，其中try_send(&self, t: T) -> Result\<(), TrySendError\<T>>，不会阻塞。在有限的内存中使用Rust的MPSC是可能的，请记住，调用者必须有一个策略来处理由于缺少放置空间而被拒绝的输入。
+
+使用MPSC改写我们的程序如下：
+```Rust
+    use std::thread;
+    use std::sync::mpsc;
+
+    fn writer(chan: mpsc::SyncSender<u32>) -> () {
+        let mut cur: u32 = 0;
+        while let Ok(()) = chan.send(cur) {
+            cur = cur.wrapping_add(1);
+        }
+    }
+
+    fn reader(read_limit: usize, chan: mpsc::Receiver<u32>) -> () {
+        let mut cur: u32 = 0;
+        while (cur as usize) < read_limit {
+            let num = chan.recv().unwrap();
+            assert_eq!(num, cur);
+            cur = cur.wrapping_add(1);
+        }
+    }
+
+    fn main() {
+        let capacity = 10;
+        let read_limit = 1_000_000;
+        let (snd, rcv) = mpsc::sync_channel(capacity);
+
+        let reader_jh = thread::spawn(move || {
+            reader(read_limit, rcv);
+        });
+        let _writer_jh = thread::spawn(move || {
+            writer(snd);
+        });
+
+        reader_jh.join().unwrap();
+    }
+```
+代码变得简短并且一点也不容易出现算术错误。Send类型SyncSender是send(&self, t: T) -> Result<(), SendError<T>>，意味着需要关注SendError来防止程序崩溃。SendError只是当远程的MPSC通道端关闭时返回的值，即在Reader达到read_limit时发生。使用perf来探测一下这个程序的性能：
+```
+Performance counter stats for './data_race03':
+
+          1,144.71 msec task-clock                       #    1.207 CPUs utilized
+           131,725      context-switches                 #  115.073 K/sec
+               127      page-faults                      #  110.945 /sec
+     2,505,925,283      cycles                           #    2.189 GHz                         (82.64%)
+     2,125,401,811      instructions                     #    0.85  insn per cycle              (84.58%)
+       441,429,077      branches                         #  385.626 M/sec                       (81.78%)
+        30,015,550      branch-misses                    #    6.80% of all branches             (84.09%)
+       206,544,370      cache-references                 #  180.434 M/sec                       (83.01%)
+         4,919,336      cache-misses                     #    2.38% of all cache refs           (83.92%)
+
+       0.948122293 seconds time elapsed
+
+       0.165672000 seconds user
+       0.882092000 seconds sys
+```
+可以看到标准库的实现，程序的性能远远优于我们的实现。
 
