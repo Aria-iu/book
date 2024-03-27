@@ -6,7 +6,7 @@ Rust旨在成为一个无俱并发的编程语言。这是什么意思？它如�
 - [x]  使用Helgrind工具在ring数据结构中检查多线程竞争 
 - [x]  使用锁Mutex来解决竞争
 - [x]  使用标准库的MPSC
-- [x]  建立一个有意义的数据复用项目
+- [x]  建立一个使用MPSC工作的项目
 
 ## Sync 和 Send
 有两个Rust并行编程人员必须要了解的trait，Send和Sync。Send这个trait可以被那些能够在线程之间传送的数据结构实现。这意味着，任何类型T: Send，都是可以在线程之间安全移动的。Rc\<T>: !Send意味着它被显式标记为不能安全的在线程之间传送。为什么呢？假设它可以在线程之间安全传送，会发生什么。我们知道Rc\<T>是使用两个计数器来计算弱引用和强引用的计数，并和数据结构T一起封装起来的数据结构。这些计数器就是程序可以耍把戏的地方。假设我们将一个Rc\<T>在线程之间进行传送，分别是A线程和B线程。当A和B同时drop指向Rc\<T>最后一个引用的时候，就会产生竞争，一个会先析构T，另一个会因为重复释放而出错。
@@ -224,6 +224,43 @@ rdr
             wrt
 ```
 这就是上面实例运行错误的原因。
+
+我们可以使用helgrind工具来验证一下：
+```
+> valgrind --tool=helgrind --history-level=full --log-file="results.txt" ./data_race00
+
+==15547== ----------------------------------------------------------------
+==15547== 
+==15547== Possible data race during write of size 4 at 0x4AC5160 by thread #3
+==15547== Locks held: none
+==15547==    at 0x110710: _ZN3std10sys_common9backtrace28__rust_begin_short_backtrace17h2ae8a33cae57ca28E.llvm.6225174379729753874 (in /home/zyc/rust_projects/Hands-On-Concurrency-with-Rust-master/Chapter04/data_races/data_race00)
+==15547==    by 0x1117E7: core::ops::function::FnOnce::call_once{{vtable.shim}} (in /home/zyc/rust_projects/Hands-On-Concurrency-with-Rust-master/Chapter04/data_races/data_race00)
+==15547==    by 0x1302C4: std::sys::pal::unix::thread::Thread::new::thread_start (boxed.rs:2016)
+==15547==    by 0x485396A: ??? (in /usr/libexec/valgrind/vgpreload_helgrind-amd64-linux.so)
+==15547==    by 0x492EAC2: start_thread (pthread_create.c:442)
+==15547==    by 0x49BFA03: clone (clone.S:100)
+==15547== 
+==15547== This conflicts with a previous write of size 4 by thread #2
+==15547== Locks held: none
+==15547==    at 0x1107EC: _ZN3std10sys_common9backtrace28__rust_begin_short_backtrace17h93320721e04667faE.llvm.6225174379729753874 (in /home/zyc/rust_projects/Hands-On-Concurrency-with-Rust-master/Chapter04/data_races/data_race00)
+==15547==    by 0x111997: core::ops::function::FnOnce::call_once{{vtable.shim}} (in /home/zyc/rust_projects/Hands-On-Concurrency-with-Rust-master/Chapter04/data_races/data_race00)
+==15547==    by 0x1302C4: std::sys::pal::unix::thread::Thread::new::thread_start (boxed.rs:2016)
+==15547==    by 0x485396A: ??? (in /usr/libexec/valgrind/vgpreload_helgrind-amd64-linux.so)
+==15547==    by 0x492EAC2: start_thread (pthread_create.c:442)
+==15547==    by 0x49BFA03: clone (clone.S:100)
+==15547==  Address 0x4ac5160 is 0 bytes inside a block of size 80 alloc'd
+==15547==    at 0x484A919: malloc (in /usr/libexec/valgrind/vgpreload_helgrind-amd64-linux.so)
+==15547==    by 0x110E41: data_race00::main (in /home/zyc/rust_projects/Hands-On-Concurrency-with-Rust-master/Chapter04/data_races/data_race00)
+==15547==    by 0x110792: std::sys_common::backtrace::__rust_begin_short_backtrace (in /home/zyc/rust_projects/Hands-On-Concurrency-with-Rust-master/Chapter04/data_races/data_race00)
+==15547==    by 0x110A28: std::rt::lang_start::{{closure}} (in /home/zyc/rust_projects/Hands-On-Concurrency-with-Rust-master/Chapter04/data_races/data_race00)
+==15547==    by 0x128850: std::rt::lang_start_internal (function.rs:284)
+==15547==    by 0x110FC4: main (in /home/zyc/rust_projects/Hands-On-Concurrency-with-Rust-master/Chapter04/data_races/data_race00)
+==15547==  Block was alloc'd by thread #1
+==15547== 
+==15547== ----------------------------------------------------------------
+
+```
+可以看到，helgrind警告我们存在数据竞争和data stomping问题。
 
 让我们来改善这一情况。显然，我们在reader和writer的竞争上存在问题，但是我们在writer的行为上也存在问题。writer完全没有意识到自己已经写过头了。经过简单的调整，我们可以阻止这种行为（验证需要写入的offset上必须是None）：
 ```Rust
@@ -472,3 +509,406 @@ Performance counter stats for './data_race03':
 ```
 可以看到标准库的实现，程序的性能远远优于我们的实现。
 
+## 实现一个遥测服务器
+
+***此处建议看英文版，因为译者也不知道这个server有什么特殊作用***
+
+让我们构建一个描述性统计服务器。这经常出现在下面的情况：需要一个东西来消耗事件，对这些东西进行某种描述性统计计算，然后将描述多路复用到其他系统。
+
+首先，Cargo.toml：
+```toml
+    [package]
+    name = "telem"
+    version = "0.1.0"
+
+    [dependencies]
+    quantiles = "0.7"
+    seahash = "3.0"
+
+    [[bin]]
+    name = "telem"
+    doc = false
+```
+我们需要，quantiles和seahash。实际执行文件在src/bin/telem.rs，这个项目是库和执行文件分离的构造。
+在src/bin/telem.rs中：
+```Rust
+    extern crate telem;
+
+    use std::{thread, time};
+    use std::sync::mpsc;
+    use telem::IngestPoint;
+    use telem::egress::{CKMSEgress, CMAEgress, Egress};
+    use telem::event::Event;
+    use telem::filter::{Filter, HighFilter, LowFilter};
+
+    fn main() {
+        let limit = 100;
+        let (lp_ic_snd, lp_ic_rcv) = mpsc::channel::<Event>();
+        let (hp_ic_snd, hp_ic_rcv) = mpsc::channel::<Event>();
+        let (ckms_snd, ckms_rcv) = mpsc::channel::<Event>();
+        let (cma_snd, cma_rcv) = mpsc::channel::<Event>();
+
+        let filter_sends = vec![lp_ic_snd, hp_ic_snd];
+        let ingest_filter_sends = filter_sends.clone();
+        let _ingest_jh = thread::spawn(move || {
+            IngestPoint::init("127.0.0.1".to_string(), 1990, ingest_filter_sends).run();
+        });
+        let _low_jh = thread::spawn(move || {
+            let mut low_filter = LowFilter::new(limit);
+            low_filter.run(lp_ic_rcv, vec![ckms_snd]);
+        });
+        let _high_jh = thread::spawn(move || {
+            let mut high_filter = HighFilter::new(limit);
+            high_filter.run(hp_ic_rcv, vec![cma_snd]);
+        });
+        let _ckms_egress_jh = thread::spawn(move || {
+            CKMSEgress::new(0.01).run(ckms_rcv);
+        });
+        let _cma_egress_jh = thread::spawn(move || {
+            CMAEgress::new().run(cma_rcv);
+        });
+
+        let one_second = time::Duration::from_millis(1_000);
+        loop {
+            for snd in &filter_sends {
+                snd.send(Event::Flush).unwrap();
+            }
+            thread::sleep(one_second);
+        }
+    }
+```
+主线程建立了工作线程，将合适的管道读\写端给予它们。有些线程有多个发送端。这就是我们使用Rust MPSC进行输出的方式。
+
+下面是IngestPoint：在src/ingest_point.rs中
+```Rust
+use event;
+use std::{net, thread};
+use std::net::ToSocketAddrs;
+use std::str;
+use std::str::FromStr;
+use std::sync::mpsc;
+use util;
+
+pub struct IngestPoint {
+    host: String,
+    port: u16,
+    chans: Vec<mpsc::Sender<event::Event>>,
+}
+
+impl IngestPoint {
+    pub fn init(
+        host: String,
+        port: u16,
+        chans: Vec<mpsc::Sender<event::Event>>,
+    ) -> IngestPoint {
+        IngestPoint {
+            chans: chans,
+            host: host,
+            port: port,
+        }
+    }
+
+    pub fn run(&mut self) {
+        let mut joins = Vec::new();
+
+        let addrs = (self.host.as_str(), self.port).to_socket_addrs();
+        if let Ok(ips) = addrs {
+            let ips: Vec<_> = ips.collect();
+            for addr in ips {
+                let listener =
+                    net::UdpSocket::bind(addr).expect("Unable to bind to UDP socket");
+                let chans = self.chans.clone();
+                joins.push(thread::spawn(move || handle_udp(chans, &listener)));
+            }
+        }
+
+        for jh in joins {
+            jh.join().expect("Uh oh, child thread panicked!");
+        }
+    }
+}
+
+fn parse_packet(buf: &str) -> Option<event::Telemetry> {
+    let mut iter = buf.split_whitespace();
+    if let Some(name) = iter.next() {
+        if let Some(val) = iter.next() {
+            match u32::from_str(val) {
+                Ok(int) => {
+                    return Some(event::Telemetry {
+                        name: name.to_string(),
+                        value: int,
+                    })
+                }
+                Err(_) => return None,
+            };
+        }
+    }
+    None
+}
+
+fn handle_udp(mut chans: Vec<mpsc::Sender<event::Event>>, socket: &net::UdpSocket) {
+    let mut buf = vec![0; 16_250];
+    loop {
+        let (len, _) = match socket.recv_from(&mut buf) {
+            Ok(r) => r,
+            Err(e) => panic!(format!("Could not read UDP socket with error {:?}", e)),
+        };
+        if let Some(telem) = parse_packet(str::from_utf8(&buf[..len]).unwrap()) {
+            util::send(&mut chans, event::Event::Telemetry(telem));
+        }
+    }
+}
+```
+IngestPoint是一个主机名，可以是IP地址或者是DNS域名，每个ToSocketAddrs，含有一个端口和装有mpsc::Sender\<event::Event>的Vector。Event是我们自己定义的：
+```Rust
+#[derive(Clone)]
+pub enum Event {
+    Telemetry(Telemetry),
+    Flush,
+}
+
+#[derive(Debug, Clone)]
+pub struct Telemetry {
+    pub name: String,
+    pub value: u32,
+}
+```
+telem项目含有两种事件：一种是Telemetry，可能来自IngresPoint，另一种是Flush。它们由主线程发出，Flush就像系统的时钟一样，允许项目的各个子系统跟踪系统时间。
+
+回到IngestPoint中：
+init方法只是进行初始化，run函数调用to_socket_addrs，检索所有关联的IP地址。这些地址中的每一个都有一个绑定到它们的UdpSocket和一个OS线程来侦听来自该套接字的数据报。最重要的方法是handle_udp，这个函数是无限循环，不断将数据报pull到16KB的缓冲区中，然后在数据报上调用parse_packet。如果这是有效的数据报，我们就调用util::send方法将Event::Telemetry发送到管道中。util::send如下：
+```Rust
+pub fn send(chans: &[mpsc::Sender<event::Event>], event: event::Event) {
+    if chans.is_empty() {
+        return;
+    }
+
+    for chan in chans.iter() {
+        chan.send(event.clone()).unwrap();
+    }
+}
+```
+下面是识别数据的方法：可以看出要识别的数据非常简单，只有一个字符串和一个数u32
+```Rust
+fn parse_packet(buf: &str) -> Option<event::Telemetry> {
+    let mut iter = buf.split_whitespace();
+    if let Some(name) = iter.next() {
+        if let Some(val) = iter.next() {
+            match u32::from_str(val) {
+                Ok(int) => {
+                    return Some(event::Telemetry {
+                        name: name.to_string(),
+                        value: int,
+                    })
+                }
+                Err(_) => return None,
+            };
+        }
+    }
+    None
+}
+```
+至于filter，HighFilter和LowFilter都实现了Filter的trait：在src/filter/mod.rs
+```Rust
+use event;
+use std::sync::mpsc;
+use util;
+
+mod high_filter;
+mod low_filter;
+
+pub use self::high_filter::*;
+pub use self::low_filter::*;
+
+pub trait Filter {
+    fn process(
+        &mut self,
+        event: event::Telemetry,
+        res: &mut Vec<event::Telemetry>,
+    ) -> ();
+
+    fn run(
+        &mut self,
+        recv: mpsc::Receiver<event::Event>,
+        chans: Vec<mpsc::Sender<event::Event>>,
+    ) {
+        let mut telems = Vec::with_capacity(64);
+        for event in recv.into_iter() {
+            match event {
+                event::Event::Flush => util::send(&chans, event::Event::Flush),
+                event::Event::Telemetry(telem) => {
+                    self.process(telem, &mut telems);
+                    for telem in telems.drain(..) {
+                        util::send(&chans, event::Event::Telemetry(telem))
+                    }
+                }
+            }
+        }
+    }
+}
+```
+下面是src/filter/low_filter.rs:
+```Rust
+use event;
+use filter::Filter;
+
+pub struct LowFilter {
+    limit: u32,
+}
+
+impl LowFilter {
+    pub fn new(limit: u32) -> Self {
+        LowFilter { limit: limit }
+    }
+}
+
+impl Filter for LowFilter {
+    fn process(
+        &mut self,
+        event: event::Telemetry,
+        res: &mut Vec<event::Telemetry>,
+    ) -> () {
+        if event.value <= self.limit {
+            res.push(event);
+        }
+    }
+}
+```
+下面是src/filter/high_filter.rs:
+```Rust
+use event;
+use filter::Filter;
+
+pub struct HighFilter {
+    limit: u32,
+}
+
+impl HighFilter {
+    pub fn new(limit: u32) -> Self {
+        HighFilter { limit: limit }
+    }
+}
+
+impl Filter for HighFilter {
+    fn process(
+        &mut self,
+        event: event::Telemetry,
+        res: &mut Vec<event::Telemetry>,
+    ) -> () {
+        if event.value >= self.limit {
+            res.push(event);
+        }
+    }
+}
+```
+可见，过滤器是判断所来的信息是不是Telemetry，查看当前的limit值，到来的信息的data字段满足条件才会将信息加入到管道中，否则过滤掉。
+
+Egress定义和Filter很像，在src/egress/mod.rs中：
+```Rust
+use event;
+use std::sync::mpsc;
+
+mod cma_egress;
+mod ckms_egress;
+
+pub use self::ckms_egress::*;
+pub use self::cma_egress::*;
+
+pub trait Egress {
+    fn deliver(&mut self, event: event::Telemetry) -> ();
+
+    fn report(&mut self) -> ();
+
+    fn run(&mut self, recv: mpsc::Receiver<event::Event>) {
+        for event in recv.into_iter() {
+            match event {
+                event::Event::Telemetry(telem) => self.deliver(telem),
+                event::Event::Flush => self.report(),
+            }
+        }
+    }
+}
+```
+若到来信息是Flush，则当前对象调用report方法进行一些输出，若是Telemetry，则调用deliver方法将Telemetry存储a起来。
+
+下面是ckms_egress，cma_egress与它很像：
+```Rust
+use egress::Egress;
+use event;
+use quantiles;
+use util;
+
+pub struct CKMSEgress {
+    error: f64,
+    data: util::HashMap<String, quantiles::ckms::CKMS<u32>>,
+    new_data_since_last_report: bool,
+}
+
+impl Egress for CKMSEgress {
+    fn deliver(&mut self, event: event::Telemetry) -> () {
+        self.new_data_since_last_report = true;
+        let val = event.value;
+        let ckms = self.data
+            .entry(event.name)
+            .or_insert(quantiles::ckms::CKMS::new(self.error));
+        ckms.insert(val);
+    }
+
+    fn report(&mut self) -> () {
+        if self.new_data_since_last_report {
+            for (k, v) in &self.data {
+                for q in &[0.0, 0.25, 0.5, 0.75, 0.9, 0.99] {
+                    println!("[CKMS] {} {}:{}", k, q, v.query(*q).unwrap().1);
+                }
+            }
+            self.new_data_since_last_report = false;
+        }
+    }
+}
+
+impl CKMSEgress {
+    pub fn new(error: f64) -> Self {
+        CKMSEgress {
+            error: error,
+            data: Default::default(),
+            new_data_since_last_report: false,
+        }
+    }
+}
+```
+实验一下：
+```
+> cargo run --release
+```
+在另外一个终端窗口上，发送UDP包。在MacOS或Linux，你可以使用nc。下面是在linux上使用
+```
+> echo "a 10" | nc -u 127.0.0.1 1990
+> echo "a 55" | nc -u 127.0.0.1 1990
+```
+结果：
+```
+[CKMS] a 0:10
+[CKMS] a 0.25:10
+[CKMS] a 0.5:10
+[CKMS] a 0.75:10
+[CKMS] a 0.9:10
+[CKMS] a 0.99:10
+[CKMS] a 0:10
+[CKMS] a 0.25:10
+[CKMS] a 0.5:10
+[CKMS] a 0.75:55
+[CKMS] a 0.9:55
+[CKMS] a 0.99:55
+```
+
+```
+> echo "b 1000" | nc -u 127.0.0.1 1990
+> echo "b 2000" | nc -u 127.0.0.1 1990
+> echo "b 3000" | nc -u 127.0.0.1 1990
+```
+结果
+```
+[CMA] b 1000
+[CMA] b 1500
+[CMA] b 2000
+```
