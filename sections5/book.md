@@ -147,3 +147,77 @@ fn main() {
 由于n主线程向通道中发送了65536×100次，所以每次reader线程都会响应，data_seen为65536×100，没有多余的信息被获取，没有多余的循环执行。
 
 但是如果reader线程不需要看到每一次的数据更改，我们在之后会有更佳的选择。
+
+
+## condvar——阻塞线程直到条件改变
+上一节的选择，一个是condvar，即CONDition VARiable。条件变量是阻塞线程的一个上好选择。
+
+条件变量的一个工作原理是：在一个mutex上lock后，将MutexGuard传递给Condvar::wait，这会阻塞这个线程。别的线程也可能经过相同的过程，在相同的条件上阻塞。一些别的线程可能会获取同一个的互斥锁，最终在这个condvar上调用notify_one或者notify_all。前者会唤醒一个线程，后者会唤醒等待这个condvar的所有线程。所以condvar可能会收到虚假唤醒，这意味着线程可能会在没有收到正确的唤醒的情况下结束阻塞。因为这个原因，条件变量要在一个loop循环中进行条件变量的检查。
+
+下面是一个示例：
+```Rust
+use std::thread;
+use std::sync::{Arc, Condvar, Mutex};
+fn main() {
+    let total_readers = 5;
+    let mutcond: Arc<(Mutex<(bool, u16)>, Condvar)> =Arc::new((Mutex::new((false, 0)),Condvar::new()));
+}
+```
+我们在mutcond上同步线程，mutcond是Arc<(Mutex<(bool, u16)>, Condvar)>。Mutex<(bool,u16)>的第二个元素就是我们的资源。第一个元素是一个Boolean Flag，我们将它看作是一个信号，表示是否可以写这个资源的权限。下面是我们的reader线程：
+```Rust
+    for _ in 0..total_readers {
+        let mutcond = Arc::clone(&mutcond);
+        reader_jhs.push(thread::spawn(move || {
+            let mut total_zeros = 0;
+            let mut total_wakes = 0;
+            let &(ref mtx, ref cnd) = &*mutcond;
+
+            while total_zeros < 100 {
+                let mut guard = mtx.lock().unwrap();
+                while !guard.0 {
+                    guard = cnd.wait(guard).unwrap();
+                }
+                guard.0 = false;
+
+                total_wakes += 1;
+                if guard.1 == 0 {
+                    total_zeros += 1;
+                }
+            }
+            total_wakes
+        }));
+    }
+```
+reader线程在mutex上上锁，如果不能写资源，就持续等待condvar，这是会释放前面在mutex上加的锁。这个reader线程会被阻塞直到notify_all()被调用。每个reader线程都会竞争，抢占成为第一个获取锁的线程。我们的reader线程之间是不合作的，因为它会立即阻止任何其他reader线程找到可用资源的机会。然而，reader线程有些还是会被虚假的唤醒，然后再次被迫等待。也许，reader线程还与writer线程相互竞争这个互斥锁。
+
+下面是writer线程：
+```Rust
+    let _ = thread::spawn(move || {
+        let &(ref mtx, ref cnd) = &*mutcond;
+        loop {
+            let mut guard = mtx.lock().unwrap();
+            guard.1 = guard.1.wrapping_add(1);
+            guard.0 = true;
+            cnd.notify_all();
+        }
+    });
+
+    for jh in reader_jhs {
+        println!("{:?}", jh.join().unwrap());
+    }
+```
+writer线程是无限循环。writer线程会获取锁，增加资源，即u16 + 1,唤醒等待的线程，释放锁。
+
+下面是运行结果：
+```
+rustc condvar_example01.rs && ./condvar_example01
+5868295
+6075531
+7898754
+6912950
+6847538
+```
+可见，这里比较之前使用MPSC的实例多了许多循环。但这不是为了说明condvar难以使用，它是很容易使用的，只是它需要与其他类型一起使用。
+
+## 屏障——barrier
+
