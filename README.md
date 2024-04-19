@@ -2,4 +2,4 @@
 
 《Hands-On Concurrency with Rust Confidently build memory-safe, parallel, and efficient software in Rust (Brian L. Troutwine)》
 
-的个人翻译，仅供参考。 </b>
+的个人翻译，仅供参考。 </b>鸣谢lilinhao1054
